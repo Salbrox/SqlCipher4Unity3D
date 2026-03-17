@@ -6,6 +6,9 @@ using UnityEngine;
 using System.Collections;
 using System.IO;
 #endif
+#if UNITY_ANDROID && !UNITY_EDITOR
+using UnityEngine.Networking;
+#endif
 namespace example
 {
     public class DataService
@@ -27,11 +30,23 @@ namespace example
                 // open StreamingAssets directory and load the db ->
 
 #if UNITY_ANDROID
-                WWW loadDb =
-     new WWW ("jar:file://" + Application.dataPath + "!/assets/" + DatabaseName); // this is the path to your StreamingAssets in android
-                while (!loadDb.isDone) { } // CAREFUL here, for safety reasons you shouldn't let this while loop unattended, place a timer and error check
-                // then save to Application.persistentDataPath
-                File.WriteAllBytes (filepath, loadDb.bytes);
+                using (UnityWebRequest loadDb = UnityWebRequest.Get("jar:file://" + Application.dataPath + "!/assets/" + DatabaseName))
+                {
+                    loadDb.SendWebRequest();
+                    float timeout = 10f;
+                    float elapsed = 0f;
+                    while (!loadDb.isDone)
+                    {
+                        System.Threading.Thread.Sleep(10);
+                        elapsed += 0.01f;
+                        if (elapsed >= timeout)
+                            throw new System.Exception("Timed out loading database from Android assets: " + DatabaseName);
+                    }
+                    if (loadDb.result != UnityWebRequest.Result.Success)
+                        throw new System.Exception("Failed to load database from Android assets: " + loadDb.error);
+                    // then save to Application.persistentDataPath
+                    File.WriteAllBytes(filepath, loadDb.downloadHandler.data);
+                }
 #elif UNITY_IOS
                 string loadDb =
      Application.dataPath + "/Raw/" + DatabaseName; // this is the path to your StreamingAssets in iOS

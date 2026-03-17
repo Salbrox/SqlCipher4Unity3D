@@ -27,6 +27,7 @@ namespace SqlCipher4Unity3D
         private static bool s_preserveDuringLinkMagic;
 
         private readonly Random _rand = new Random();
+        private readonly object _randLock = new object();
 
         private TimeSpan _busyTimeout;
         private long _elapsedMilliseconds;
@@ -99,8 +100,8 @@ namespace SqlCipher4Unity3D
             {
                 SQLite3.Result result = SQLite3.Key(handle, password, password.Length);
                 if (result != SQLite3.Result.OK)
-                    throw SQLiteException.New(r,
-                        string.Format("Could not open database file: {0} ({1})", this.DatabasePath, r));
+                    throw SQLiteException.New(result,
+                        string.Format("Could not open database file: {0} ({1})", this.DatabasePath, result));
             }
 
             _open = true;
@@ -383,6 +384,8 @@ namespace SqlCipher4Unity3D
                 mx = ((UnaryExpression)property.Body).Operand as MemberExpression;
             else
                 mx = property.Body as MemberExpression;
+            if (mx == null)
+                throw new ArgumentException("The lambda expression 'property' should point to a valid Property");
             PropertyInfo propertyInfo = mx.Member as PropertyInfo;
             if (propertyInfo == null)
                 throw new ArgumentException("The lambda expression 'property' should point to a valid Property");
@@ -390,7 +393,10 @@ namespace SqlCipher4Unity3D
             string propName = propertyInfo.Name;
 
             TableMapping map = GetMapping<T>();
-            string colName = map.FindColumnWithPropertyName(propName).Name;
+            TableMapping.Column col = map.FindColumnWithPropertyName(propName);
+            if (col == null)
+                throw new ArgumentException("Could not find a mapped column for property: " + propName);
+            string colName = col.Name;
 
             CreateIndex(map.TableName, colName, unique);
         }
@@ -651,7 +657,10 @@ namespace SqlCipher4Unity3D
         public T Get<T>(object pk) where T : new()
         {
             TableMapping map = GetMapping(typeof(T));
-            return Query<T>(map.GetByPrimaryKeySql, pk).First();
+            List<T> results = Query<T>(map.GetByPrimaryKeySql, pk);
+            if (results.Count == 0)
+                throw new InvalidOperationException(string.Format("Object of type {0} with primary key {1} was not found.", typeof(T), pk));
+            return results[0];
         }
 
         /// <summary>
@@ -667,7 +676,10 @@ namespace SqlCipher4Unity3D
         /// </returns>
         public T Get<T>(Expression<Func<T, bool>> predicate) where T : new()
         {
-            return Table<T>().Where(predicate).First();
+            T result = Table<T>().Where(predicate).FirstOrDefault();
+            if (result == null)
+                throw new InvalidOperationException(string.Format("Object of type {0} matching the given predicate was not found.", typeof(T)));
+            return result;
         }
 
         /// <summary>
@@ -775,7 +787,9 @@ namespace SqlCipher4Unity3D
         public string SaveTransactionPoint()
         {
             int depth = Interlocked.Increment(ref _transactionDepth) - 1;
-            string retVal = "S" + _rand.Next(short.MaxValue) + "D" + depth;
+            int randVal;
+            lock (_randLock) { randVal = _rand.Next(short.MaxValue); }
+            string retVal = "S" + randVal + "D" + depth;
 
             try
             {
@@ -1114,8 +1128,11 @@ namespace SqlCipher4Unity3D
             {
                 PropertyInfo prop = objType.GetProperty(map.PK.PropertyName);
                 if (prop != null)
-                    if (prop.GetValue(obj, null).Equals(Guid.Empty))
+                {
+                    object propVal = prop.GetValue(obj, null);
+                    if (propVal == null || propVal.Equals(Guid.Empty))
                         prop.SetValue(obj, Guid.NewGuid(), null);
+                }
             }
 
             bool replacing = string.Compare(extra, "OR REPLACE", StringComparison.OrdinalIgnoreCase) == 0;
@@ -1305,7 +1322,7 @@ namespace SqlCipher4Unity3D
                 {
                     if (_mappings != null)
                         foreach (TableMapping sqlInsertCommand in _mappings.Values)
-                            sqlInsertCommand.Dispose();
+                            try { sqlInsertCommand.Dispose(); } catch { }
                     SQLite3.Result r = SQLite3.Close(this.Handle);
                     if (r != SQLite3.Result.OK)
                     {
@@ -1934,7 +1951,10 @@ namespace SqlCipher4Unity3D
                 if (_conn.StoreDateTimeAsTicks) return new DateTime(SQLite3.ColumnInt64(stmt, index));
 
                 string text = SQLite3.ColumnString(stmt, index);
-                return DateTime.Parse(text);
+                DateTime parsedDate;
+                if (!DateTime.TryParse(text, out parsedDate))
+                    throw new FormatException(string.Format("Cannot parse DateTime from value '{0}'.", text));
+                return parsedDate;
             }
 
             if (clrType == typeof(DateTimeOffset))
@@ -2221,11 +2241,14 @@ namespace SqlCipher4Unity3D
 
                 if (mem != null && mem.Expression.NodeType == ExpressionType.Parameter)
                 {
+                    TableMapping.Column orderCol = this.Table.FindColumnWithPropertyName(mem.Member.Name);
+                    if (orderCol == null)
+                        throw new NotSupportedException("Cannot order by property '" + mem.Member.Name + "': no mapped column found.");
                     TableQuery<T> q = Clone<T>();
                     if (q._orderBys == null) q._orderBys = new List<Ordering>();
                     q._orderBys.Add(new Ordering
                     {
-                        ColumnName = this.Table.FindColumnWithPropertyName(mem.Member.Name).Name,
+                        ColumnName = orderCol.Name,
                         Ascending = asc
                     });
                     return q;
@@ -2410,7 +2433,10 @@ namespace SqlCipher4Unity3D
                     // This is a column of our table, output just the column name
                     // Need to translate it if that column name is mapped
                     //
-                    string columnName = this.Table.FindColumnWithPropertyName(mem.Member.Name).Name;
+                    TableMapping.Column exprCol = this.Table.FindColumnWithPropertyName(mem.Member.Name);
+                    if (exprCol == null)
+                        throw new NotSupportedException("Cannot compile member access: no mapped column found for property '" + mem.Member.Name + "'.");
+                    string columnName = exprCol.Name;
                     return new CompileResult { CommandText = "\"" + columnName + "\"" };
                 }
 
@@ -2551,7 +2577,10 @@ namespace SqlCipher4Unity3D
         public T First()
         {
             TableQuery<T> query = Take(1);
-            return query.ToList().First();
+            List<T> list = query.ToList();
+            if (list.Count == 0)
+                throw new InvalidOperationException(string.Format("Sequence of type {0} contains no elements.", typeof(T)));
+            return list[0];
         }
 
         public T FirstOrDefault()
